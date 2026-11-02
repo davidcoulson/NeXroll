@@ -107,6 +107,7 @@ from backend.preroll_files import (
     validate_storage_component,
 )
 from backend import preroll_trash
+from backend import media_probe
 from backend import dashboard_layout
 from backend import health_summary
 from backend.community_filter import filter_ai_prerolls, is_ai_preroll
@@ -231,6 +232,19 @@ def ensure_schema() -> None:
 
             if not _sqlite_has_column("prerolls", "enabled"):
                 _sqlite_add_column("prerolls", "enabled BOOLEAN DEFAULT 1")
+
+            # Prerolls: media facts from ffprobe (resolution, codecs, HDR, ARC-safe audio)
+            for col, ddl in [
+                ("resolution", "resolution TEXT"),
+                ("video_codec", "video_codec TEXT"),
+                ("hdr_type", "hdr_type TEXT"),
+                ("audio_codec", "audio_codec TEXT"),
+                ("audio_channels", "audio_channels INTEGER"),
+                ("audio_arc_ok", "audio_arc_ok BOOLEAN"),
+                ("media_probed_at", "media_probed_at DATETIME"),
+            ]:
+                if not _sqlite_has_column("prerolls", col):
+                    _sqlite_add_column("prerolls", ddl)
 
             # Genre maps: ensure canonical normalized key for robust matching/synonyms
             if not _sqlite_has_column("genre_maps", "genre_norm"):
@@ -2921,6 +2935,9 @@ def startup_event():
 
     # Weekly Community index refresh; does nothing unless the user turned it on.
     threading.Thread(target=_community_auto_refresh_loop, daemon=True, name="community-auto-refresh").start()
+
+    # Read resolution / codecs for prerolls that have none yet, in the background.
+    _start_media_backfill()
 
 @app.on_event("startup")
 def startup_env_bootstrap():
@@ -9124,6 +9141,7 @@ def upload_preroll(
             _file_log(f"upload_preroll: Error auto-applying to Plex: {e}")
 
     log_event('INFO', 'user', f"Preroll '{preroll.filename}' uploaded", details={"preroll_id": preroll.id, "category_id": preroll.category_id})
+    _start_media_backfill()
 
     return {
         "uploaded": True,
@@ -9399,6 +9417,7 @@ def upload_multiple_prerolls(
             except Exception as e:
                 _file_log(f"upload_multiple: Error auto-applying to Plex: {e}")
 
+    _start_media_backfill()
     return {
         "total_files": len(files),
         "successful_uploads": successful_uploads,
@@ -9647,7 +9666,8 @@ def get_preroll_video_info(preroll_id: int, db: Session = Depends(get_db)):
                 "duration": format_info.get("duration"),
                 "file_size": format_info.get("size"),
                 "bitrate": format_info.get("bit_rate"),
-                "frame_rate": video_stream.get("r_frame_rate")
+                "frame_rate": video_stream.get("r_frame_rate"),
+                **_preroll_media_fields(preroll),
             }
     except Exception as e:
         _file_log(f"[VIDEO-INFO] Error probing video: {e}")
@@ -9657,10 +9677,121 @@ def get_preroll_video_info(preroll_id: int, db: Session = Depends(get_db)):
         "error": "Could not retrieve video information"
     }
 
+# --- Media facts (ffprobe) and audio conversion for ARC / Dolby Digital-only chains --------
+
+def _preroll_media_fields(p) -> dict:
+    """The ffprobe-derived columns as API fields (None until probed)."""
+    return {
+        "resolution": getattr(p, "resolution", None),
+        "video_codec": getattr(p, "video_codec", None),
+        "hdr_type": getattr(p, "hdr_type", None),
+        "audio_codec": getattr(p, "audio_codec", None),
+        "audio_channels": getattr(p, "audio_channels", None),
+        "audio_arc_ok": getattr(p, "audio_arc_ok", None),
+    }
+
+
+def _preroll_abs_path(p) -> str:
+    return p.path if (p.path and os.path.isabs(p.path)) else os.path.join(data_dir, p.path or "")
+
+
+def _probe_preroll_row(p) -> bool:
+    """Fill the media columns of one row from its file. False when it could not be read.
+
+    media_probed_at is set either way so an unreadable file is not retried on every start."""
+    info = None
+    try:
+        info = media_probe.probe_media(_preroll_abs_path(p), get_ffprobe_cmd(), _run_subprocess)
+    except Exception as e:
+        _file_log(f"[MEDIA-PROBE] {p.filename}: {e}", level="WARNING")
+    if info:
+        for key, value in info.items():
+            setattr(p, key, value)
+    p.media_probed_at = utcnow()
+    return bool(info)
+
+
+_media_backfill = {"running": False, "done": 0, "failed": 0, "total": 0, "started_at": None, "finished_at": None}
+_media_backfill_gate = threading.Lock()
+
+
+def _run_media_backfill(force: bool):
+    db = SessionLocal()
+    try:
+        query = db.query(models.Preroll.id)
+        if not force:
+            query = query.filter(models.Preroll.media_probed_at.is_(None))
+        ids = [r[0] for r in query.order_by(models.Preroll.id).all()]
+        _media_backfill["total"] = len(ids)
+        for pid in ids:
+            p = db.query(models.Preroll).filter(models.Preroll.id == pid).first()
+            # A missing file is left unprobed so it is picked up when the file shows up.
+            if not p or not p.path or not os.path.isfile(_preroll_abs_path(p)):
+                _media_backfill["failed"] += 1
+                continue
+            ok = _probe_preroll_row(p)
+            db.commit()
+            _media_backfill["done" if ok else "failed"] += 1
+    except Exception as e:
+        _file_log(f"[MEDIA-PROBE] backfill stopped: {e}", level="ERROR")
+        db.rollback()
+    finally:
+        db.close()
+        with _media_backfill_gate:
+            _media_backfill.update({"running": False, "finished_at": utcnow().isoformat()})
+        if _media_backfill["total"]:
+            _file_log(f"[MEDIA-PROBE] backfill: {_media_backfill['done']} read, {_media_backfill['failed']} skipped of {_media_backfill['total']}")
+
+
+def _start_media_backfill(force: bool = False) -> bool:
+    """Start the background pass over prerolls without media facts unless one is running."""
+    with _media_backfill_gate:
+        if _media_backfill["running"]:
+            return False
+        _media_backfill.update({"running": True, "done": 0, "failed": 0, "total": 0,
+                                "started_at": utcnow().isoformat(), "finished_at": None})
+    threading.Thread(target=_run_media_backfill, args=(force,), daemon=True, name="media-backfill").start()
+    return True
+
+
+@app.post("/prerolls/media-backfill")
+def media_backfill_start(force: bool = False):
+    """Read resolution, codecs, HDR and audio from prerolls that have none (force=true: every preroll)."""
+    started = _start_media_backfill(force)
+    return {"started": started, **_media_backfill}
+
+
+@app.get("/prerolls/media-backfill")
+def media_backfill_status():
+    return dict(_media_backfill)
+
+
 @app.get("/prerolls")
-def get_prerolls(db: Session = Depends(get_db), category_id: str = "", tags: str = "", search: str = ""):
+def get_prerolls(db: Session = Depends(get_db), category_id: str = "", tags: str = "", search: str = "",
+                 resolution: str = "", hdr: str = "", audio_ok: str = ""):
+    """List prerolls. Media filters: ``resolution`` (e.g. 2160p), ``hdr`` (any | none | SDR |
+    HDR10 | HLG | Dolby Vision) and ``audio_ok`` (true | false | unknown, the ARC check)."""
     # Base query
     query = db.query(models.Preroll)
+
+    if resolution.strip():
+        query = query.filter(models.Preroll.resolution == resolution.strip().lower())
+    if hdr.strip():
+        wanted = hdr.strip().lower()
+        if wanted == "any":
+            query = query.filter(models.Preroll.hdr_type.in_(["HDR10", "HLG", "Dolby Vision"]))
+        elif wanted == "none":
+            query = query.filter(or_(models.Preroll.hdr_type == "SDR", models.Preroll.hdr_type.is_(None)))
+        else:
+            query = query.filter(func.lower(models.Preroll.hdr_type) == wanted)
+    if audio_ok.strip():
+        wanted = audio_ok.strip().lower()
+        if wanted in ("true", "1", "yes"):
+            query = query.filter(models.Preroll.audio_arc_ok.is_(True))
+        elif wanted in ("false", "0", "no"):
+            query = query.filter(models.Preroll.audio_arc_ok.is_(False))
+        elif wanted == "unknown":
+            query = query.filter(models.Preroll.audio_arc_ok.is_(None))
 
     # Handle category filtering (m2m only after v1.13.0). Special value "uncategorized"
     # returns prerolls with zero categories.
@@ -9720,7 +9851,8 @@ def get_prerolls(db: Session = Depends(get_db), category_id: str = "", tags: str
             "upload_date": p.upload_date,
             "community_preroll_id": getattr(p, "community_preroll_id", None),
             "exclude_from_matching": getattr(p, "exclude_from_matching", False),
-            "file_exists": bool(p.path and os.path.exists(file_path))
+            "file_exists": bool(p.path and os.path.exists(file_path)),
+            **_preroll_media_fields(p),
         })
     return result
 
@@ -9902,6 +10034,7 @@ def update_preroll(preroll_id: int, payload: PrerollUpdate, db: Session = Depend
         "description": p.description,
         "tags": p.tags,
         "exclude_from_matching": getattr(p, "exclude_from_matching", False),
+        **_preroll_media_fields(p),
     }
 
 # --- Trash and ignore-list routes -------------------------------------------
@@ -16606,6 +16739,7 @@ def rescan_prerolls(
             source='rescan_prerolls',
             details=stats,
         )
+        _start_media_backfill()
         return stats
     except Exception as e:
         log_event('ERROR', 'system', f'Preroll rescan failed: {e}', source='rescan_prerolls')

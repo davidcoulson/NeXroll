@@ -38,6 +38,14 @@ class Preroll(Base):
     exclude_from_matching = Column(Boolean, default=False)  # Exclude from auto-matching to community prerolls
     file_hash = Column(String, nullable=True, index=True)  # SHA256 hash for duplicate detection
     enabled = Column(Boolean, default=True)  # When False, scheduler skips this preroll in random / category picks. Set by NeX-Up trailer toggle to disable a trailer's preroll record everywhere it could be picked.
+    # Media facts from ffprobe (backend/media_probe.py); NULL until probed.
+    resolution = Column(String, nullable=True)  # e.g., "2160p"
+    video_codec = Column(String, nullable=True)
+    hdr_type = Column(String, nullable=True)  # SDR, HDR10, HLG or Dolby Vision
+    audio_codec = Column(String, nullable=True)
+    audio_channels = Column(Integer, nullable=True)
+    audio_arc_ok = Column(Boolean, nullable=True)  # False = may not pass an ARC / Dolby Digital-only chain; NULL = unknown
+    media_probed_at = Column(DateTime, nullable=True)  # Set once a probe was attempted, so a file ffprobe can't read isn't retried every start
 
     category = relationship("Category")
     # Additional categories (many-to-many via preroll_categories)

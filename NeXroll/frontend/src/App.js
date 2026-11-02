@@ -1,6 +1,8 @@
 import TrailerRatingFilter from './components/TrailerRatingFilter';
 import TrailerGenreMatch from './components/TrailerGenreMatch';
 import CommunityAIBadge from './components/CommunityAIBadge';
+import PrerollMediaBadges, { MediaFilterChips } from './components/PrerollMediaBadges';
+import { matchesMediaFilters, hasMediaFilters } from './utils/mediaBadges';
 import ConflictLink from './components/ConflictLink';
 import LibraryTrailersTile from './components/LibraryTrailersTile';
 import { isAICommunitySource } from './utils/communityAI';
@@ -2550,6 +2552,7 @@ const isScheduleActiveOnDay = (schedule, dayTime, normalizeDay) => {
   const [filterTags, setFilterTags] = useState('');
   const [filterCategory, setFilterCategory] = useState('');
   const [filterMatchStatus, setFilterMatchStatus] = useState(''); // Filter by community match status
+  const [mediaFilters, setMediaFilters] = useState({ resolution: '', hdr: '', audio: '' }); // ffprobe-based library filters
   // Library sort. Defaults to newest-first so recently added prerolls are the
   // first thing you see; persisted per browser like the view and page-size prefs.
   const [prerollSortField, setPrerollSortField] = useState(() => {
@@ -2816,7 +2819,7 @@ const isScheduleActiveOnDay = (schedule, dayTime, normalizeDay) => {
   useEffect(() => {
     // Reset to first page when any filter or the sort order changes
     setCurrentPage(1);
-  }, [filterCategory, filterTags, filterMatchStatus, prerollSortField, prerollSortDirection]);
+  }, [filterCategory, filterTags, filterMatchStatus, mediaFilters, prerollSortField, prerollSortDirection]);
 
   // Ensure tab title always shows "NeXroll" (guards against cached index.html/manifest)
   useEffect(() => {
@@ -6907,6 +6910,11 @@ const isScheduleActiveOnDay = (schedule, dayTime, normalizeDay) => {
       filtered = filtered.filter(p => !p.community_preroll_id);
     }
 
+    // 3b. Media facts (resolution / HDR / ARC-safe audio)
+    if (hasMediaFilters(mediaFilters)) {
+      filtered = filtered.filter(p => matchesMediaFilters(p, mediaFilters));
+    }
+
     // 4. Hide generator output unless asked for. Skipped when the user has
     //    explicitly picked one of those categories, so choosing "NeX-Up Prerolls"
     //    from the category filter never returns an empty list.
@@ -6931,7 +6939,7 @@ const isScheduleActiveOnDay = (schedule, dayTime, normalizeDay) => {
 
     // 5. Sort last, so the ordering applies to what survived the filters.
     return sortPrerolls(filtered, prerollSortField, prerollSortDirection);
-  }, [prerolls, categories, filterCategory, filterTags, filterMatchStatus, showNexupGeneratedInLibrary, showNexupTrailersInLibrary, prerollSortField, prerollSortDirection]);
+  }, [prerolls, categories, filterCategory, filterTags, filterMatchStatus, mediaFilters, showNexupGeneratedInLibrary, showNexupTrailersInLibrary, prerollSortField, prerollSortDirection]);
 
   const totalPrerolls = filteredPrerolls.length;
   // How many prerolls the generator-output rule is holding back right now. Only
@@ -11771,6 +11779,7 @@ const DashboardTiles = {
             ))}
             <button type="button" className={`nx-hybrid-filter-chip is-dot${filterMatchStatus === 'matched' ? ' is-active' : ''}`} onClick={() => { const on = filterMatchStatus === 'matched'; setFilterMatchStatus(on ? '' : 'matched'); if (!on) setFilterCategory(''); setCurrentPage(1); }}>Matched &middot; {matchedCount}</button>
             <button type="button" className={`nx-hybrid-filter-chip is-dot is-warn${filterCategory === 'uncategorized' ? ' is-active' : ''}`} onClick={() => { setFilterCategory(filterCategory === 'uncategorized' ? '' : 'uncategorized'); setFilterMatchStatus(''); setCurrentPage(1); }}>Uncategorized · {uncategorizedCount}</button>
+            <MediaFilterChips filters={mediaFilters} onChange={setMediaFilters} prerolls={prerolls} />
             <details className="nx-hybrid-more">
               <summary className="nx-hybrid-filter-chip"><Sliders size={10} /> More filters</summary>
               <div className="nx-hybrid-more-menu">
@@ -11886,6 +11895,7 @@ const DashboardTiles = {
                             <div className="nx-hybrid-card-title" title={preroll.display_name || preroll.filename}>{preroll.display_name || preroll.filename}</div>
                             <div className="nx-hybrid-card-meta"><span className="nx-hybrid-badge">{primaryCategoryFor(preroll)}</span><span className={`nx-hybrid-badge is-${status.toLowerCase()}`}>{status}</span></div>
                             <CommunityAIBadge isAI={isAICommunitySource(preroll.community_preroll_id)} className="nx-library-ai-badge" />
+                            <PrerollMediaBadges preroll={preroll} />
                             {tagsFor(preroll).length > 0 && <div className="nx-hybrid-card-tags">{tagsFor(preroll).slice(0, 3).map(tag => <span key={tag}>{tag}</span>)}</div>}
                           </div>
                         </article>
@@ -11905,7 +11915,7 @@ const DashboardTiles = {
                             <td><input type="checkbox" checked={selectedPrerollIds.includes(preroll.id)} onChange={() => toggleSelectPreroll(preroll.id)} onClick={(event) => event.stopPropagation()} /></td>
                             <td><div className="nx-hybrid-row-name"><div className="nx-hybrid-row-thumb">{artwork(preroll, true)}</div><div><strong title={preroll.display_name || preroll.filename}>{preroll.display_name || preroll.filename}</strong><span title={preroll.filename}>{preroll.filename}</span></div></div></td>
                             <td>{primaryCategoryFor(preroll)}</td>
-                            <td>{preroll.duration ? `${Math.round(preroll.duration)}s` : '—'}</td>
+                            <td>{preroll.duration ? `${Math.round(preroll.duration)}s` : '—'}<PrerollMediaBadges preroll={preroll} /></td>
                             <td><span className={`nx-hybrid-badge is-${status.toLowerCase()}`}>{status}</span><CommunityAIBadge isAI={isAICommunitySource(preroll.community_preroll_id)} className="nx-library-ai-badge" /></td>
                             <td>{dateFor(preroll)}</td>
                             <td><div className="nx-hybrid-row-actions"><button type="button" onClick={(event) => { event.stopPropagation(); handleLibraryPreview(preroll); }} title="Preview"><Play size={13} /></button><button type="button" onClick={(event) => { event.stopPropagation(); handleEditPreroll(preroll); }} title="Edit"><Edit size={13} /></button><button type="button" className="is-danger" onClick={(event) => { event.stopPropagation(); handleDeletePreroll(preroll.id); }} title="Move to trash"><Trash size={13} /></button></div></td>
@@ -12246,6 +12256,7 @@ const DashboardTiles = {
             <option value="matched">Matched only</option>
             <option value="unmatched">Unmatched only</option>
           </select>
+          <MediaFilterChips filters={mediaFilters} onChange={setMediaFilters} prerolls={prerolls} chipClass="button button-secondary" />
           {(() => {
             const directionLabel = describeSort(prerollSortField, prerollSortDirection);
             return (
@@ -12666,6 +12677,7 @@ const DashboardTiles = {
               )}
               {preroll.description && <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{preroll.description}</p>}
               {preroll.duration && <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Duration: {Math.round(preroll.duration)}s</p>}
+              <PrerollMediaBadges preroll={preroll} />
               <p style={{ fontSize: '0.8rem', color: 'var(--text-muted, #999)' }}>
                 {new Date(preroll.upload_date).toLocaleDateString()}
               </p>
@@ -12826,6 +12838,7 @@ const DashboardTiles = {
              )}
              {preroll.description && <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{preroll.description}</div>}
              {preroll.duration && <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Duration: {Math.round(preroll.duration)}s</div>}
+             <PrerollMediaBadges preroll={preroll} />
              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted, #999)' }}>
                {new Date(preroll.upload_date).toLocaleDateString()}
              </div>
