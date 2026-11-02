@@ -7,7 +7,7 @@ import {
   Globe, ArrowRight, HardDrive, Key, FileText, Users, Download, Info, FolderTree,
   Github, Heart, Archive, Star,
   ChevronDown, ChevronRight, PanelLeftClose, PanelLeftOpen, X, Search, CornerDownLeft, ArrowUpCircle,
-  Clapperboard,
+  Clapperboard, Filter,
 } from 'lucide-react';
 import { matchMovieQuote } from '../utils/easterEggs';
 
@@ -65,6 +65,7 @@ const NAV = [
       { id: 'schedules/calendar', label: 'Calendar View', icon: CalendarDays },
       { id: 'schedules/builder', label: 'Sequence Builder', icon: Film },
       { id: 'schedules/library', label: 'Saved Sequences', icon: BookOpen },
+      { id: 'schedules/rules', label: 'Film Rules', icon: Filter },
       { id: 'schedules/conflicts', label: 'Conflicts', icon: GitCompare },
     ],
   },
@@ -135,6 +136,7 @@ const KEYWORDS = {
   'schedules/calendar': 'calendar month week view',
   'schedules/builder': 'sequence builder blocks order playlist',
   'schedules/library': 'saved sequences reusable nexseq nexbundle import export',
+  'schedules/rules': 'film rules movie 4k hdr atmos genre rating title per movie category sequence',
   'schedules/conflicts': 'conflict overlap priority exclusive blend resolve',
   'nexup': 'radarr sonarr connections integrations trailers automation',
   'nexup/upcoming': 'upcoming movies tv shows radarr sonarr releases',

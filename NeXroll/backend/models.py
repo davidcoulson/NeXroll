@@ -91,6 +91,29 @@ class GenreMap(Base):
 
     # When this Plex genre is detected, apply this category's prerolls
     category = relationship("Category")
+class FilmRule(Base):
+    """Per-film rule: when the film about to play matches, use a category or sequence."""
+    __tablename__ = "rules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, index=True)
+    enabled = Column(Boolean, default=True)
+    priority = Column(Integer, default=0)  # Higher runs first; the first matching rule wins
+    match = Column(String, default="all")  # 'all' or 'any' of the conditions must hold
+    conditions = Column(Text)  # JSON object, see backend/rules_engine.py
+    action_type = Column(String)  # 'category' or 'sequence'
+    action_id = Column(Integer)
+    created_at = Column(DateTime, default=utcnow)
+    updated_at = Column(DateTime, default=utcnow, onupdate=utcnow)
+
+    def get_conditions(self):
+        try:
+            value = json.loads(self.conditions) if self.conditions else {}
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+
 class Schedule(Base):
     __tablename__ = "schedules"
 

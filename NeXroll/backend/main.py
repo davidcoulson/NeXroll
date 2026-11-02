@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy import and_, or_, select, func, text
 from sqlalchemy.exc import IntegrityError, OperationalError
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Any, List, Optional
 import datetime
 import pytz
 import os
@@ -108,6 +108,7 @@ from backend.preroll_files import (
 )
 from backend import preroll_trash
 from backend import media_probe
+from backend import rules_engine as film_rules
 from backend import dashboard_layout
 from backend import health_summary
 from backend.community_filter import filter_ai_prerolls, is_ai_preroll
@@ -32004,6 +32005,139 @@ def _bootstrap_jellyfin_from_env() -> None:
 #  to retrieve the currently-active preroll paths for intro injection.
 # ---------------------------------------------------------------------------
 
+# --- Per-film rules -------------------------------------------------------------------------
+# Pick a category or sequence by the film about to play (see backend/rules_engine.py).
+# Wired into the Jellyfin/Emby plugin path (_resolve_current_intros). Plex gives NeXroll no
+# "what plays next" hook, so Plex callers use POST /rules/evaluate.
+
+class FilmRuleIn(BaseModel):
+    name: str
+    enabled: bool = True
+    priority: int = 0
+    match: str = "all"          # "all" or "any" of the conditions
+    conditions: dict = {}       # min_resolution, hdr, atmos, genres, content_ratings, title_contains
+    action_type: str            # "category" or "sequence"
+    action_id: int
+
+
+class FilmRuleEvaluate(BaseModel):
+    title: Optional[str] = None
+    year: Optional[int] = None
+    rating_key: Optional[str] = None       # echoed nowhere; NeXroll does not look films up in Plex
+    genres: list[str] = []
+    content_rating: Optional[str] = None
+    video_resolution: Optional[str] = None  # "4k", "2160p", "1080" ...
+    hdr: Optional[Any] = None               # true / false or "HDR10", "Dolby Vision", "SDR" ...
+    audio_codec: Optional[str] = None
+    audio_profile: Optional[str] = None
+    atmos: Optional[bool] = None
+
+
+def _film_rule_target(db: Session, action_type: str, action_id: int):
+    if action_type == "category":
+        return db.query(models.Category).filter(models.Category.id == action_id).first()
+    if action_type == "sequence":
+        return db.query(models.SavedSequence).filter(models.SavedSequence.id == action_id).first()
+    return None
+
+
+def _film_rule_to_dict(db: Session, r) -> dict:
+    target = _film_rule_target(db, r.action_type, r.action_id)
+    return {
+        "id": r.id, "name": r.name, "enabled": bool(r.enabled), "priority": r.priority or 0,
+        "match": r.match or "all", "conditions": r.get_conditions(),
+        "action": {"type": r.action_type, "id": r.action_id,
+                   "name": getattr(target, "name", None), "missing": target is None},
+    }
+
+
+def _film_rule_apply(db: Session, rule: models.FilmRule, payload: FilmRuleIn) -> None:
+    name = (payload.name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="A rule needs a name")
+    if payload.match not in film_rules.MATCH_MODES:
+        raise HTTPException(status_code=400, detail="match must be 'all' or 'any'")
+    if payload.action_type not in film_rules.ACTION_TYPES:
+        raise HTTPException(status_code=400, detail="action_type must be 'category' or 'sequence'")
+    if _film_rule_target(db, payload.action_type, payload.action_id) is None:
+        raise HTTPException(status_code=400, detail=f"That {payload.action_type} does not exist")
+    conditions = film_rules.normalize_conditions(payload.conditions)
+    if not conditions:
+        raise HTTPException(status_code=400, detail="Add at least one condition")
+    rule.name, rule.enabled, rule.priority, rule.match = name, payload.enabled, payload.priority, payload.match
+    rule.conditions = json.dumps(conditions)
+    rule.action_type, rule.action_id = payload.action_type, payload.action_id
+
+
+@app.get("/rules")
+def list_film_rules(db: Session = Depends(get_db)):
+    rows = db.query(models.FilmRule).order_by(models.FilmRule.priority.desc(), models.FilmRule.id).all()
+    return [_film_rule_to_dict(db, r) for r in rows]
+
+
+@app.post("/rules", status_code=201)
+def create_film_rule(payload: FilmRuleIn, db: Session = Depends(get_db)):
+    rule = models.FilmRule()
+    _film_rule_apply(db, rule, payload)
+    db.add(rule)
+    db.commit()
+    db.refresh(rule)
+    return _film_rule_to_dict(db, rule)
+
+
+@app.put("/rules/{rule_id}")
+def update_film_rule(rule_id: int, payload: FilmRuleIn, db: Session = Depends(get_db)):
+    rule = db.query(models.FilmRule).filter(models.FilmRule.id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    _film_rule_apply(db, rule, payload)
+    db.commit()
+    return _film_rule_to_dict(db, rule)
+
+
+@app.delete("/rules/{rule_id}")
+def delete_film_rule(rule_id: int, db: Session = Depends(get_db)):
+    rule = db.query(models.FilmRule).filter(models.FilmRule.id == rule_id).first()
+    if not rule:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    db.delete(rule)
+    db.commit()
+    return {"deleted": True}
+
+
+def _enabled_film_rules(db: Session) -> list:
+    return [{"id": r.id, "name": r.name, "enabled": True, "priority": r.priority or 0, "match": r.match,
+             "conditions": r.get_conditions(), "action": {"type": r.action_type, "id": r.action_id}}
+            for r in db.query(models.FilmRule).filter(models.FilmRule.enabled.is_(True)).all()]
+
+
+@app.post("/rules/evaluate")
+def evaluate_film_rules(payload: FilmRuleEvaluate, db: Session = Depends(get_db)):
+    """Which rule (and so which category or sequence) applies to this film. Changes nothing."""
+    rules = _enabled_film_rules(db)
+    chosen = film_rules.choose_rule(rules, payload.model_dump() if hasattr(payload, "model_dump") else payload.dict())
+    if not chosen:
+        return {"matched": False, "rule": None, "action": None, "checked": len(rules)}
+    target = _film_rule_target(db, chosen["action"]["type"], chosen["action"]["id"])
+    return {"matched": True, "checked": len(rules),
+            "rule": {"id": chosen["id"], "name": chosen["name"], "priority": chosen["priority"]},
+            "action": {**chosen["action"], "name": getattr(target, "name", None)}}
+
+
+def _pick_film_rule(db: Session, media_type, item_id, server_type, genres) -> Optional[dict]:
+    """The rule for the item a Jellyfin/Emby plugin is about to play, or None."""
+    if media_type and str(media_type).lower() != "movie":
+        return None
+    rules = _enabled_film_rules(db)
+    if not rules:
+        return None
+    from backend.media_genres import item_details
+    film = dict((item_details(db, item_id, server_type) or {}).get("film") or {})
+    if genres:
+        film["genres"] = list(genres)
+    return film_rules.choose_rule(rules, film) if film else None
+
+
 def _resolve_current_intros(db: Session, media_type: Optional[str] = None,
                             item_id: Optional[str] = None, server_type: Optional[str] = None,
                             genres: Optional[list] = None, whole_pool: bool = False) -> dict:
@@ -32145,6 +32279,31 @@ def _resolve_current_intros(db: Session, media_type: Optional[str] = None,
                         }
                 except (ValueError, TypeError):
                     pass
+
+    # --- 1b. Per-film rule: a matching rule picks the category or sequence for this film ---
+    # Falls through to the schedule when the rule's target resolves to nothing, so a rule
+    # pointing at an empty category never leaves the film without prerolls.
+    if not whole_pool and item_id:
+        try:
+            rule = _pick_film_rule(db, media_type, item_id, server_type, genres)
+            if rule:
+                kind, target_id = rule["action"]["type"], rule["action"]["id"]
+                _file_log(f"[PLUGIN] Film rule '{rule['name']}' matched; using {kind} {target_id}")
+                if kind == "sequence":
+                    seq_paths = _resolve_sequence(target_id, "film-rule")
+                    if seq_paths or _saved_sequence_has_policy(target_id):
+                        return {"paths": seq_paths, "mode": "sequential"}
+                else:
+                    prerolls = _prerolls_for_category(target_id)
+                    if prerolls:
+                        cat = db.query(models.Category).filter(models.Category.id == target_id).first()
+                        return {
+                            "paths": [os.path.abspath(p.path) for p in prerolls],
+                            "mode": "sequential" if cat and getattr(cat, "plex_mode", "shuffle") == "playlist" else "shuffle",
+                            "rotation": ("film-rule", target_id),
+                        }
+        except Exception as e:
+            _file_log(f"[PLUGIN] Film rule check failed: {e}", level="WARNING")
 
     # --- 2. Active schedule sequence (Emby/Jellyfin: serve the scheduler's resolved sequence) ---
     active_sched_id = getattr(setting, "active_schedule_id", None)

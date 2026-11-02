@@ -1,6 +1,7 @@
 import TrailerRatingFilter from './components/TrailerRatingFilter';
 import TrailerGenreMatch from './components/TrailerGenreMatch';
 import CommunityAIBadge from './components/CommunityAIBadge';
+import FilmRulesPanel from './components/FilmRulesPanel';
 import PrerollMediaBadges, { MediaFilterChips } from './components/PrerollMediaBadges';
 import { matchesMediaFilters, hasMediaFilters } from './utils/mediaBadges';
 import ConflictLink from './components/ConflictLink';
@@ -8659,6 +8660,7 @@ const DashboardTiles = {
     'schedules/calendar': { icon: CalendarDays, section: 'Schedules / Command Center', title: 'Schedule Calendar', desc: 'A familiar operational calendar with enough detail to understand playback behavior.' },
     'schedules/builder': { icon: Clapperboard, section: 'Schedules / Command Center', title: 'Sequence Builder', desc: 'Assemble ordered blocks with a focused inspector and live sequence totals.' },
     'schedules/library': { icon: BookOpen, section: 'Schedules / Command Center', title: 'Saved Sequences', desc: 'Search, inspect, and reuse complete playback experiences.' },
+    'schedules/rules': { icon: Filter, section: 'Schedules / Command Center', title: 'Film Rules', desc: 'Pick a category or sequence by the film that is about to play.' },
     'schedules/conflicts': { icon: GitCompare, section: 'Schedules / Command Center', title: 'Schedule Conflicts', desc: 'Compare overlapping rules, understand the outcome, and apply safe fixes.' },
     'nexup':            { icon: Clapperboard, section: 'NeX-Up', title: 'Connections', desc: 'Connect Radarr and Sonarr to discover upcoming media and automatically fetch trailers.' },
     'nexup/upcoming':   { icon: ClipboardList, section: 'NeX-Up', title: 'Upcoming', desc: 'Review future releases from Radarr and Sonarr and control trailer eligibility.' },
@@ -20826,6 +20828,10 @@ const DashboardTiles = {
 
     if (activeTab === 'schedules/library') {
       return renderApprovedSequenceLibrary();
+    }
+
+    if (activeTab === 'schedules/rules') {
+      return <FilmRulesPanel apiUrl={apiUrl} categories={categories} sequences={savedSequences} showAlert={showAlert} />;
     }
 
     if (activeTab === 'schedules/conflicts') {

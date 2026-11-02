@@ -61,7 +61,7 @@ def _fetch_item(base, headers, prefix, item_id) -> Optional[dict]:
     # /Items?Ids= works on Emby and on Jellyfin 10.9+, unlike /Items/{id},
     # which Emby does not serve. Emby lists tags as TagItems; Jellyfin rejects
     # field names it doesn't know, so it is only asked for its own.
-    fields = "Genres,SeriesId,ProviderIds,Tags,Path" + (",TagItems" if prefix else "")
+    fields = "Genres,SeriesId,ProviderIds,Tags,Path,MediaStreams" + (",TagItems" if prefix else "")
     r = requests.get(
         f"{base}{prefix}/Items",
         params={"Ids": item_id, "Fields": fields, "Recursive": "true"},
@@ -103,7 +103,10 @@ def _lookup(db, item_id: str, server_type: Optional[str]) -> Optional[dict]:
             ids = item.get("ProviderIds") or {}
             tmdb = next((str(v) for k, v in ids.items() if str(k).lower() == "tmdb" and v), None)
             path = item.get("Path") if isinstance(item.get("Path"), str) else None
-            return {"genres": genres, "tmdb": tmdb, "tags": tags, "path": path}
+            from backend.rules_engine import film_from_media_item
+            film = film_from_media_item(item)
+            film["genres"] = genres  # an episode's own list is empty; use the series' (above)
+            return {"genres": genres, "tmdb": tmdb, "tags": tags, "path": path, "film": film}
         except Exception:
             continue
     return None
@@ -116,8 +119,8 @@ def item_genres(db, item_id: Optional[str], server_type: Optional[str] = None) -
 
 
 def item_details(db, item_id: Optional[str], server_type: Optional[str] = None) -> Optional[dict]:
-    """{"genres": [...], "tmdb": "123" or None, "tags": [...], "path": str or None}
-    for the item, or None when the server can't be asked."""
+    """{"genres": [...], "tmdb": "123" or None, "tags": [...], "path": str or None,
+    "film": the facts per-film rules match on} for the item, or None when the server can't be asked."""
     item_id = str(item_id or "").strip()
     if not item_id or item_id == "0":
         return None
