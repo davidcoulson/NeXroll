@@ -353,6 +353,8 @@ class Setting(Base):
     clear_when_inactive = Column(Boolean, default=False)  # When enabled, clear Plex preroll field when no schedules are active
     # Plex playback guard: minutes a newly started video holds back a preroll change (0 = off)
     playback_guard_minutes = Column(Integer, default=20)
+    # Convert to DD+: keep the original file (in an originals/ folder) instead of replacing it
+    convert_keep_original = Column(Boolean, default=True)
     
     # NeX-Up Settings (Radarr integration for upcoming movie trailers)
     nexup_enabled = Column(Boolean, default=False)  # Master enable/disable for NeX-Up feature

@@ -245,6 +245,9 @@ def ensure_schema() -> None:
             ]:
                 if not _sqlite_has_column("prerolls", col):
                     _sqlite_add_column("prerolls", ddl)
+            # Settings: keep the original file when converting audio to DD+
+            if not _sqlite_has_column("settings", "convert_keep_original"):
+                _sqlite_add_column("settings", "convert_keep_original BOOLEAN DEFAULT 1")
 
             # Genre maps: ensure canonical normalized key for robust matching/synonyms
             if not _sqlite_has_column("genre_maps", "genre_norm"):
@@ -9764,6 +9767,203 @@ def media_backfill_start(force: bool = False):
 @app.get("/prerolls/media-backfill")
 def media_backfill_status():
     return dict(_media_backfill)
+
+
+@app.get("/settings/convert-keep-original")
+def get_convert_keep_original(db: Session = Depends(get_db)):
+    """Whether converting a preroll's audio keeps the original file (in an originals/ folder)."""
+    setting = db.query(models.Setting).first()
+    return {"keep_original": getattr(setting, "convert_keep_original", True) is not False}
+
+
+@app.put("/settings/convert-keep-original")
+def update_convert_keep_original(keep_original: bool, db: Session = Depends(get_db)):
+    setting = db.query(models.Setting).first()
+    if not setting:
+        setting = models.Setting(plex_url=None, plex_token=None)
+        db.add(setting)
+        db.commit()
+        db.refresh(setting)
+    setting.convert_keep_original = bool(keep_original)
+    setting.updated_at = utcnow()
+    db.commit()
+    return {"keep_original": bool(keep_original)}
+
+
+CONVERT_JOBS: "OrderedDict[str, dict]" = collections.OrderedDict()
+CONVERT_JOBS_LOCK = threading.Lock()
+CONVERT_JOBS_MAX = 200
+_convert_pool = None  # one worker: ffmpeg jobs run one at a time
+
+
+def _convert_job_update(job_id: str, **fields) -> None:
+    with CONVERT_JOBS_LOCK:
+        if job_id in CONVERT_JOBS:
+            CONVERT_JOBS[job_id].update(fields)
+
+
+def _unique_original_path(folder: str, name: str) -> str:
+    stem, ext = os.path.splitext(name)
+    candidate, n = os.path.join(folder, name), 1
+    while os.path.exists(candidate):
+        candidate = os.path.join(folder, f"{stem} ({n}){ext}")
+        n += 1
+    return candidate
+
+
+def _convert_check(p, force: bool = False) -> Optional[tuple]:
+    """(status_code, reason) when this preroll must not be converted, else None."""
+    src = _preroll_abs_path(p)
+    if not getattr(p, "managed", True):
+        return 409, "Externally mapped files are never modified"
+    if not os.path.isfile(src):
+        return 404, "Video file not found"
+    if not _is_within_directory(PREROLLS_DIR, src):
+        return 400, "File is outside the preroll folder"
+    if not media_probe.can_convert(src):
+        return 400, "Unsupported container for audio conversion"
+    if getattr(p, "audio_arc_ok", None) is True and not force:
+        return 409, "Audio already passes an ARC / Dolby Digital chain (use force to convert anyway)"
+    return None
+
+
+def _run_convert_job(job_id: str, preroll_id: int) -> None:
+    _convert_job_update(job_id, state="running", started_at=utcnow().isoformat())
+    db = SessionLocal()
+    tmp = None
+    try:
+        p = db.query(models.Preroll).filter(models.Preroll.id == preroll_id).first()
+        if not p:
+            raise RuntimeError("Preroll no longer exists")
+        problem = _convert_check(p, force=True)
+        if problem:
+            raise RuntimeError(problem[1])
+        setting = db.query(models.Setting).first()
+        keep = getattr(setting, "convert_keep_original", True) is not False
+        src = os.path.realpath(_preroll_abs_path(p))
+        before = media_probe.probe_media(src, get_ffprobe_cmd(), _run_subprocess)
+        if not before or not before["audio_codec"]:
+            raise RuntimeError("No audio track to convert")
+        folder, name = os.path.split(src)
+        stem, ext = os.path.splitext(name)
+        tmp = os.path.join(folder, f".{stem}.converting{ext}")  # dot-prefixed: the scanner ignores it
+        cmd = media_probe.build_eac3_cmd(get_ffmpeg_cmd(), src, tmp, before["audio_channels"])
+        res = _run_subprocess(cmd, capture_output=True, text=True, timeout=3600)
+        if res.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
+            raise RuntimeError(f"ffmpeg failed: {(res.stderr or '').strip()[-300:] or res.returncode}")
+        after = media_probe.probe_media(tmp, get_ffprobe_cmd(), _run_subprocess)
+        if not after or after["audio_codec"] != "eac3":
+            raise RuntimeError("Converted file did not verify as E-AC-3")
+
+        original = None
+        if keep:
+            odir = os.path.join(folder, "originals")  # the scanner skips this folder
+            os.makedirs(odir, exist_ok=True)
+            original = _unique_original_path(odir, name)
+            try:
+                os.link(src, original)  # same data, nothing is ever missing
+            except OSError:
+                os.replace(src, original)  # no hard links here; the file is back in place a moment later
+        try:
+            os.replace(tmp, src)
+        except Exception:
+            if original and not os.path.exists(src):
+                os.replace(original, src)
+            raise
+        tmp = None
+
+        p.file_size = os.path.getsize(src)
+        try:
+            p.file_hash = calculate_file_hash(src)
+        except Exception:
+            pass
+        for key, value in after.items():
+            setattr(p, key, value)
+        p.media_probed_at = utcnow()
+        db.commit()
+        _convert_job_update(job_id, state="done", finished_at=utcnow().isoformat(),
+                            message=("Original kept in originals/" if keep else "Original replaced"),
+                            audio_codec=after["audio_codec"], audio_channels=after["audio_channels"])
+        log_event('INFO', 'user', f"Converted audio of '{p.filename}' to E-AC-3", source='convert_audio',
+                  details={"preroll_id": p.id, "kept_original": keep})
+    except Exception as e:
+        db.rollback()
+        _file_log(f"[CONVERT-AUDIO] preroll {preroll_id}: {e}", level="ERROR")
+        _convert_job_update(job_id, state="failed", error=str(e), finished_at=utcnow().isoformat())
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        db.close()
+
+
+def _queue_convert(p) -> dict:
+    """Queue a conversion of one preroll, or return the job already queued/running for it."""
+    global _convert_pool
+    with CONVERT_JOBS_LOCK:
+        for existing in CONVERT_JOBS.values():
+            if existing["preroll_id"] == p.id and existing["state"] in ("queued", "running"):
+                return dict(existing)
+        job = {"id": uuid.uuid4().hex[:12], "preroll_id": p.id, "filename": p.filename, "state": "queued",
+               "error": None, "message": None, "queued_at": utcnow().isoformat(),
+               "started_at": None, "finished_at": None}
+        CONVERT_JOBS[job["id"]] = job
+        while len(CONVERT_JOBS) > CONVERT_JOBS_MAX:
+            oldest = next(iter(CONVERT_JOBS))
+            if CONVERT_JOBS[oldest]["state"] in ("queued", "running"):
+                break
+            CONVERT_JOBS.popitem(last=False)
+        if _convert_pool is None:
+            from concurrent.futures import ThreadPoolExecutor
+            _convert_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="convert-audio")
+        _convert_pool.submit(_run_convert_job, job["id"], p.id)
+        return dict(job)
+
+
+@app.post("/prerolls/convert-audio/flagged", status_code=202)
+def convert_flagged_audio(db: Session = Depends(get_db)):
+    """Queue every preroll whose audio won't pass an ARC / Dolby Digital chain (audio_arc_ok = false)."""
+    queued, skipped = [], 0
+    for p in db.query(models.Preroll).filter(models.Preroll.audio_arc_ok.is_(False)).order_by(models.Preroll.id).all():
+        if _convert_check(p):
+            skipped += 1
+            continue
+        queued.append(_queue_convert(p)["id"])
+    return {"queued": len(queued), "skipped": skipped, "job_ids": queued}
+
+
+@app.get("/prerolls/convert-audio/jobs")
+def list_convert_jobs():
+    with CONVERT_JOBS_LOCK:
+        jobs = [dict(j) for j in CONVERT_JOBS.values()]
+    return {"jobs": jobs[::-1],
+            "active": sum(1 for j in jobs if j["state"] in ("queued", "running"))}
+
+
+@app.get("/prerolls/convert-audio/jobs/{job_id}")
+def get_convert_job(job_id: str):
+    with CONVERT_JOBS_LOCK:
+        job = CONVERT_JOBS.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Job not found")
+        return dict(job)
+
+
+@app.post("/prerolls/{preroll_id}/convert-audio", status_code=202)
+def convert_preroll_audio(preroll_id: int, force: bool = False, db: Session = Depends(get_db)):
+    """Re-encode the preroll's audio to E-AC-3 (5.1, or 2.0 for stereo) at 640k, copying the video.
+
+    Runs as a background job: poll GET /prerolls/convert-audio/jobs/{job_id}. The original is kept
+    in an originals/ folder next to the file unless the convert_keep_original setting is off."""
+    p = db.query(models.Preroll).filter(models.Preroll.id == preroll_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Preroll not found")
+    problem = _convert_check(p, force=force)
+    if problem:
+        raise HTTPException(status_code=problem[0], detail=problem[1])
+    return _queue_convert(p)
 
 
 @app.get("/prerolls")

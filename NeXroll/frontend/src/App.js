@@ -2553,6 +2553,9 @@ const isScheduleActiveOnDay = (schedule, dayTime, normalizeDay) => {
   const [filterCategory, setFilterCategory] = useState('');
   const [filterMatchStatus, setFilterMatchStatus] = useState(''); // Filter by community match status
   const [mediaFilters, setMediaFilters] = useState({ resolution: '', hdr: '', audio: '' }); // ffprobe-based library filters
+  const [convertingIds, setConvertingIds] = useState([]); // prerolls with an audio conversion queued or running
+  const [convertAllBusy, setConvertAllBusy] = useState(false);
+  const convertJobsSeen = React.useRef(new Set());
   // Library sort. Defaults to newest-first so recently added prerolls are the
   // first thing you see; persisted per browser like the view and page-size prefs.
   const [prerollSortField, setPrerollSortField] = useState(() => {
@@ -6874,6 +6877,62 @@ const isScheduleActiveOnDay = (schedule, dayTime, normalizeDay) => {
     if (Number.isNaN(deleted)) return null;
     const elapsedDays = (Date.now() - deleted) / 86400000;
     return Math.max(0, Math.ceil(trashRetentionDays - elapsedDays));
+  };
+
+  // Audio conversion to Dolby Digital Plus runs as a background job on the server; poll it
+  // until the queue is empty, then reload so the badges show the new audio.
+  const pollConvertJobs = async () => {
+    for (let i = 0; i < 720; i += 1) {
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      try {
+        const res = await fetch(apiUrl('prerolls/convert-audio/jobs'));
+        const data = await res.json();
+        if (!data.active) {
+          const failed = (data.jobs || []).filter(j => j.state === 'failed' && convertJobsSeen.current.has(j.id));
+          setConvertingIds([]);
+          setConvertAllBusy(false);
+          fetchData();
+          if (failed.length) showAlert(`Audio conversion failed for ${failed.length} preroll(s): ${failed[0].error || 'see the log'}`, 'error');
+          else showAlert('Audio conversion finished', 'success');
+          return;
+        }
+      } catch (e) { /* keep polling */ }
+    }
+    setConvertingIds([]);
+    setConvertAllBusy(false);
+  };
+
+  const convertPrerollAudio = async (preroll) => {
+    try {
+      const res = await fetch(apiUrl(`prerolls/${preroll.id}/convert-audio`), { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { showAlert(data.detail || 'Could not start the conversion', 'error'); return; }
+      convertJobsSeen.current.add(data.id);
+      setConvertingIds(prev => (prev.includes(preroll.id) ? prev : [...prev, preroll.id]));
+      showAlert(`Converting "${preroll.display_name || preroll.filename}" to Dolby Digital Plus in the background`, 'info');
+      pollConvertJobs();
+    } catch (e) {
+      showAlert(`Could not start the conversion: ${e?.message || e}`, 'error');
+    }
+  };
+
+  const convertAllFlagged = async () => {
+    try {
+      setConvertAllBusy(true);
+      const res = await fetch(apiUrl('prerolls/convert-audio/flagged'), { method: 'POST' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.queued) {
+        setConvertAllBusy(false);
+        showAlert(res.ok ? 'Nothing to convert' : (data.detail || 'Could not start the conversion'), res.ok ? 'info' : 'error');
+        return;
+      }
+      (data.job_ids || []).forEach(id => convertJobsSeen.current.add(id));
+      showAlert(`Converting ${data.queued} preroll(s) to Dolby Digital Plus in the background`, 'info');
+      pollConvertJobs();
+    } catch (e) {
+      setConvertAllBusy(false);
+      showAlert(`Could not start the conversion: ${e?.message || e}`, 'error');
+    }
   };
 
   // Apply client-side filters in order: category/tags first, then match status
@@ -11779,7 +11838,7 @@ const DashboardTiles = {
             ))}
             <button type="button" className={`nx-hybrid-filter-chip is-dot${filterMatchStatus === 'matched' ? ' is-active' : ''}`} onClick={() => { const on = filterMatchStatus === 'matched'; setFilterMatchStatus(on ? '' : 'matched'); if (!on) setFilterCategory(''); setCurrentPage(1); }}>Matched &middot; {matchedCount}</button>
             <button type="button" className={`nx-hybrid-filter-chip is-dot is-warn${filterCategory === 'uncategorized' ? ' is-active' : ''}`} onClick={() => { setFilterCategory(filterCategory === 'uncategorized' ? '' : 'uncategorized'); setFilterMatchStatus(''); setCurrentPage(1); }}>Uncategorized · {uncategorizedCount}</button>
-            <MediaFilterChips filters={mediaFilters} onChange={setMediaFilters} prerolls={prerolls} />
+            <MediaFilterChips filters={mediaFilters} onChange={setMediaFilters} prerolls={prerolls} onConvertAll={convertAllFlagged} converting={convertAllBusy} />
             <details className="nx-hybrid-more">
               <summary className="nx-hybrid-filter-chip"><Sliders size={10} /> More filters</summary>
               <div className="nx-hybrid-more-menu">
@@ -11895,7 +11954,7 @@ const DashboardTiles = {
                             <div className="nx-hybrid-card-title" title={preroll.display_name || preroll.filename}>{preroll.display_name || preroll.filename}</div>
                             <div className="nx-hybrid-card-meta"><span className="nx-hybrid-badge">{primaryCategoryFor(preroll)}</span><span className={`nx-hybrid-badge is-${status.toLowerCase()}`}>{status}</span></div>
                             <CommunityAIBadge isAI={isAICommunitySource(preroll.community_preroll_id)} className="nx-library-ai-badge" />
-                            <PrerollMediaBadges preroll={preroll} />
+                            <PrerollMediaBadges preroll={preroll} onConvert={convertPrerollAudio} converting={convertingIds.includes(preroll.id)} />
                             {tagsFor(preroll).length > 0 && <div className="nx-hybrid-card-tags">{tagsFor(preroll).slice(0, 3).map(tag => <span key={tag}>{tag}</span>)}</div>}
                           </div>
                         </article>
@@ -11915,7 +11974,7 @@ const DashboardTiles = {
                             <td><input type="checkbox" checked={selectedPrerollIds.includes(preroll.id)} onChange={() => toggleSelectPreroll(preroll.id)} onClick={(event) => event.stopPropagation()} /></td>
                             <td><div className="nx-hybrid-row-name"><div className="nx-hybrid-row-thumb">{artwork(preroll, true)}</div><div><strong title={preroll.display_name || preroll.filename}>{preroll.display_name || preroll.filename}</strong><span title={preroll.filename}>{preroll.filename}</span></div></div></td>
                             <td>{primaryCategoryFor(preroll)}</td>
-                            <td>{preroll.duration ? `${Math.round(preroll.duration)}s` : '—'}<PrerollMediaBadges preroll={preroll} /></td>
+                            <td>{preroll.duration ? `${Math.round(preroll.duration)}s` : '—'}<PrerollMediaBadges preroll={preroll} onConvert={convertPrerollAudio} converting={convertingIds.includes(preroll.id)} /></td>
                             <td><span className={`nx-hybrid-badge is-${status.toLowerCase()}`}>{status}</span><CommunityAIBadge isAI={isAICommunitySource(preroll.community_preroll_id)} className="nx-library-ai-badge" /></td>
                             <td>{dateFor(preroll)}</td>
                             <td><div className="nx-hybrid-row-actions"><button type="button" onClick={(event) => { event.stopPropagation(); handleLibraryPreview(preroll); }} title="Preview"><Play size={13} /></button><button type="button" onClick={(event) => { event.stopPropagation(); handleEditPreroll(preroll); }} title="Edit"><Edit size={13} /></button><button type="button" className="is-danger" onClick={(event) => { event.stopPropagation(); handleDeletePreroll(preroll.id); }} title="Move to trash"><Trash size={13} /></button></div></td>
@@ -12256,7 +12315,7 @@ const DashboardTiles = {
             <option value="matched">Matched only</option>
             <option value="unmatched">Unmatched only</option>
           </select>
-          <MediaFilterChips filters={mediaFilters} onChange={setMediaFilters} prerolls={prerolls} chipClass="button button-secondary" />
+          <MediaFilterChips filters={mediaFilters} onChange={setMediaFilters} prerolls={prerolls} onConvertAll={convertAllFlagged} converting={convertAllBusy} chipClass="button button-secondary" />
           {(() => {
             const directionLabel = describeSort(prerollSortField, prerollSortDirection);
             return (
@@ -12677,7 +12736,7 @@ const DashboardTiles = {
               )}
               {preroll.description && <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>{preroll.description}</p>}
               {preroll.duration && <p style={{ fontSize: '0.8rem', color: 'var(--text-secondary)' }}>Duration: {Math.round(preroll.duration)}s</p>}
-              <PrerollMediaBadges preroll={preroll} />
+              <PrerollMediaBadges preroll={preroll} onConvert={convertPrerollAudio} converting={convertingIds.includes(preroll.id)} />
               <p style={{ fontSize: '0.8rem', color: 'var(--text-muted, #999)' }}>
                 {new Date(preroll.upload_date).toLocaleDateString()}
               </p>
@@ -12838,7 +12897,7 @@ const DashboardTiles = {
              )}
              {preroll.description && <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>{preroll.description}</div>}
              {preroll.duration && <div style={{ fontSize: '0.85rem', color: 'var(--text-secondary)' }}>Duration: {Math.round(preroll.duration)}s</div>}
-             <PrerollMediaBadges preroll={preroll} />
+             <PrerollMediaBadges preroll={preroll} onConvert={convertPrerollAudio} converting={convertingIds.includes(preroll.id)} />
              <div style={{ fontSize: '0.8rem', color: 'var(--text-muted, #999)' }}>
                {new Date(preroll.upload_date).toLocaleDateString()}
              </div>

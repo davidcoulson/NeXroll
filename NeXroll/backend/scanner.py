@@ -33,7 +33,7 @@ VALID_VIDEO_EXTENSIONS = {
 # video extension (MPEG-TS), those were being treated as prerolls and each spawned
 # a failing FFmpeg thumbnail job — enough to make NeXroll unresponsive when the
 # provider lands inside the prerolls folder. Never descend into them.
-SKIP_DIRS = {'thumbnails', 'temp', 'nexup_temp', 'tmp', '__pycache__',
+SKIP_DIRS = {'thumbnails', 'temp', 'nexup_temp', 'tmp', '__pycache__', 'originals',
              'node_modules', 'bgutil-provider'}
 
 

@@ -1,4 +1,4 @@
-"""Preroll media facts from ffprobe.
+"""Preroll media facts from ffprobe, and the ffmpeg command that makes a preroll ARC-safe.
 
 Pure helpers: they take ffprobe's JSON and return plain values, so they can be
 tested without ffmpeg. main.py supplies the subprocess runner and the tool paths.
@@ -15,6 +15,9 @@ ARC_PASS_CODECS = {"ac3", "eac3"}
 # Passes only as stereo/mono, where the source decodes to plain 2.0 PCM.
 ARC_STEREO_CODECS = {"aac", "mp3", "mp2", "opus", "vorbis"}
 ARC_FAIL_CODECS = {"truehd", "mlp", "flac"}  # plus dts*, dca and pcm* by prefix
+
+# Containers that carry E-AC-3 and that ffmpeg can stream-copy video into.
+CONVERT_EXTENSIONS = {".mp4", ".m4v", ".mov", ".mkv", ".ts", ".m2ts", ".mts"}
 
 ARC_WARNING = "This audio may not pass an ARC / Dolby Digital-only chain"
 
@@ -122,3 +125,25 @@ def probe_media(path: str, ffprobe_cmd: str, run) -> Optional[dict]:
     if result.returncode != 0 or not result.stdout:
         return None
     return parse_probe(json.loads(result.stdout))
+
+
+def eac3_channels(source_channels) -> int:
+    """5.1 for anything with more than two channels, else stereo."""
+    return 6 if (source_channels or 2) > 2 else 2
+
+
+def can_convert(path: str) -> bool:
+    return os.path.splitext(path or "")[1].lower() in CONVERT_EXTENSIONS
+
+
+def build_eac3_cmd(ffmpeg_cmd: str, src: str, dst: str, source_channels, bitrate: str = "640k") -> list:
+    """ffmpeg argv: copy the first video stream, re-encode the first audio track
+    to E-AC-3 (5.1, or 2.0 for a stereo/mono source). Other tracks and
+    subtitles are dropped; the container stays the same."""
+    cmd = [ffmpeg_cmd, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", src,
+           "-map", "0:v:0", "-map", "0:a:0",
+           "-c:v", "copy", "-c:a", "eac3", "-b:a", bitrate, "-ac", str(eac3_channels(source_channels)),
+           "-map_metadata", "0"]
+    if os.path.splitext(dst)[1].lower() in (".mp4", ".m4v", ".mov"):
+        cmd += ["-movflags", "+faststart"]
+    return cmd + [dst]
